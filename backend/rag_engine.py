@@ -1,13 +1,12 @@
 import os
 import asyncio
 import tempfile
+import numpy as np
 from typing import AsyncGenerator
 
 from groq import AsyncGroq
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_openai import OpenAIEmbeddings
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
@@ -20,22 +19,73 @@ Do NOT hallucinate or use outside knowledge."""
 PLAIN_SYSTEM_PROMPT = """You are a helpful AI assistant. Answer the following question using your general knowledge."""
 
 
+class SimpleVectorStore:
+    """Lightweight TF-IDF vector store - no external API needed."""
+
+    def __init__(self):
+        self.chunks = []
+        self.vocab = {}
+        self.matrix = None
+
+    def _tokenize(self, text):
+        import re
+        tokens = re.findall(r'\b[a-zA-Z]{2,}\b', text.lower())
+        return tokens
+
+    def _build_vocab(self):
+        self.vocab = {}
+        idx = 0
+        for chunk in self.chunks:
+            for token in set(self._tokenize(chunk.page_content)):
+                if token not in self.vocab:
+                    self.vocab[token] = idx
+                    idx += 1
+
+    def _vectorize(self, text):
+        tokens = self._tokenize(text)
+        vec = np.zeros(len(self.vocab))
+        for token in tokens:
+            if token in self.vocab:
+                vec[self.vocab[token]] += 1
+        norm = np.linalg.norm(vec)
+        return vec / norm if norm > 0 else vec
+
+    def add_documents(self, chunks):
+        self.chunks.extend(chunks)
+        self._build_vocab()
+        self.matrix = np.array([self._vectorize(c.page_content) for c in self.chunks])
+
+    def similarity_search_with_score(self, query, k=4):
+        if self.matrix is None or len(self.chunks) == 0:
+            return []
+        q_vec = self._vectorize(query)
+        # Pad or trim query vector to match matrix width
+        if len(q_vec) < self.matrix.shape[1]:
+            q_vec = np.pad(q_vec, (0, self.matrix.shape[1] - len(q_vec)))
+        else:
+            q_vec = q_vec[:self.matrix.shape[1]]
+        scores = self.matrix @ q_vec
+        top_k = np.argsort(scores)[::-1][:k]
+        return [(self.chunks[i], float(scores[i])) for i in top_k]
+
+    def clear(self):
+        self.chunks = []
+        self.vocab = {}
+        self.matrix = None
+
+
 class RAGEngine:
     def __init__(self):
-        self.vectorstore = None
+        self.vectorstore = SimpleVectorStore()
         self.documents = []
         self.doc_metadata = []
         self.groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
-        self.embeddings = OpenAIEmbeddings(
-            model="text-embedding-3-small",
-            openai_api_key=os.getenv("OPENAI_API_KEY"),
-        )
 
     def has_documents(self) -> bool:
-        return self.vectorstore is not None
+        return len(self.documents) > 0
 
     def clear(self):
-        self.vectorstore = None
+        self.vectorstore.clear()
         self.documents = []
         self.doc_metadata = []
 
@@ -65,15 +115,7 @@ class RAGEngine:
                 chunk.metadata["chunk_id"] = i
                 chunk.metadata["source_file"] = filename
 
-            if self.vectorstore is None:
-                self.vectorstore = await asyncio.to_thread(
-                    FAISS.from_documents, chunks, self.embeddings
-                )
-            else:
-                new_store = await asyncio.to_thread(
-                    FAISS.from_documents, chunks, self.embeddings
-                )
-                self.vectorstore.merge_from(new_store)
+            await asyncio.to_thread(self.vectorstore.add_documents, chunks)
 
             self.documents.extend(chunks)
             self.doc_metadata.append(
@@ -101,7 +143,7 @@ class RAGEngine:
                 {
                     "text": doc.page_content[:200] + "...",
                     "page": doc.metadata.get("page", 0) + 1,
-                    "score": round(float(1 - score), 3),
+                    "score": round(float(score), 3),
                     "file": doc.metadata.get("source_file", "unknown"),
                 }
             )
@@ -125,12 +167,12 @@ class RAGEngine:
         is_hallucination_risk = (
             "not found" in rag_answer.lower()
             or "not mentioned" in rag_answer.lower()
-            or avg_score < 0.3
+            or avg_score < 0.1
         )
 
-        if avg_score >= 0.6:
+        if avg_score >= 0.4:
             confidence = "high"
-        elif avg_score >= 0.4:
+        elif avg_score >= 0.2:
             confidence = "medium"
         else:
             confidence = "low"

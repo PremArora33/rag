@@ -1,18 +1,17 @@
 import os
-import io
-import time
+import asyncio
+import tempfile
 from typing import AsyncGenerator
+
 from groq import AsyncGroq
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
-import tempfile
-import asyncio
+from langchain_openai import OpenAIEmbeddings
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
-SYSTEM_PROMPT = """You are a precise document Q&A assistant. 
+SYSTEM_PROMPT = """You are a precise document Q&A assistant.
 Answer questions ONLY based on the provided context chunks from the document.
 If the answer is not found in the context, explicitly say: "This information is not found in the uploaded document."
 Be concise, accurate, and cite which part of the document supports your answer.
@@ -26,15 +25,10 @@ class RAGEngine:
         self.vectorstore = None
         self.documents = []
         self.doc_metadata = []
-        self.embeddings = None
         self.groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
-        self._init_embeddings()
-
-    def _init_embeddings(self):
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2",
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": True},
+        self.embeddings = OpenAIEmbeddings(
+            model="text-embedding-3-small",
+            openai_api_key=os.getenv("OPENAI_API_KEY"),
         )
 
     def has_documents(self) -> bool:
